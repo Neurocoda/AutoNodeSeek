@@ -4,10 +4,10 @@ Author: Neurocoda
 Updated: 2026-02-03
 
 [task_local]
-0 9 * * * nodeseek_checkin.js, tag=NodeSeek Check-in, img-url=https://www.nodeseek.com/static/images/icon.png, enabled=true
+0 9 * * * https://raw.githubusercontent.com/Neurocoda/AutoNodeSeek/refs/heads/main/AutoNodeSeek.js, tag=AutoNodeSeek, enabled=true
 
 [rewrite_local]
-^https:\/\/www\.nodeseek\.com\/($|api\/account\/signIn) url script-request-header nodeseek_checkin.js
+^https:\/\/www\.nodeseek\.com\/($|api\/account\/signIn) url script-request-header https://raw.githubusercontent.com/Neurocoda/AutoNodeSeek/refs/heads/main/AutoNodeSeek.js
 
 [mitm]
 hostname = www.nodeseek.com
