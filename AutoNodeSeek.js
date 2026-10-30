@@ -1,33 +1,32 @@
 // NodeSeek Auto Check-in & Cookie Capture
 // Author: Neurocoda
-// Updated: 2026-10-28
+// Updated: 2026-10-30
 //
-// 注意: 此处使用行注释而非块注释，因为下面的 cron 表达式以 "*/" 开头，
+// 注意: 此处使用行注释而非块注释，因为下面的 cron 表达式以 "*/" 或 "*" 开头，
 //       若放在 /* */ 块注释中会提前闭合注释导致语法错误。
 //
 // [task_local]
-// */5 8-12 * * * https://raw.githubusercontent.com/Neurocoda/AutoNodeSeek/refs/heads/main/AutoNodeSeek.js, tag=AutoNodeSeek, enabled=true
+// # 方案一 (推荐，全随机): 每分钟检测一次，到达当天抽取的随机分钟和秒数后触发，零点整秒无特征
+// * 8-12 * * * https://raw.githubusercontent.com/Neurocoda/AutoNodeSeek/refs/heads/main/AutoNodeSeek.js#v=2.0, tag=AutoNodeSeek, enabled=true
+//
+// # 方案二 (兼容旧习惯): 每 5 分钟触发一次，命中后在 5~120 秒内随机抖动发出
+// # */5 8-12 * * * https://raw.githubusercontent.com/Neurocoda/AutoNodeSeek/refs/heads/main/AutoNodeSeek.js#v=2.0, tag=AutoNodeSeek, enabled=true
 //
 // [rewrite_local]
-// ^https:\/\/www\.nodeseek\.com\/($|api\/account\/signIn) url script-request-header https://raw.githubusercontent.com/Neurocoda/AutoNodeSeek/refs/heads/main/AutoNodeSeek.js
+// ^https:\/\/www\.nodeseek\.com\/($|api\/account\/signIn) url script-request-header https://raw.githubusercontent.com/Neurocoda/AutoNodeSeek/refs/heads/main/AutoNodeSeek.js#v=2.0
 //
 // [mitm]
 // hostname = www.nodeseek.com
-//
-// 说明: QX 的 cron 不支持内置随机延时，因此改为每 5 分钟触发一次，
-// 由脚本在 08:00 - 12:00 之间随机挑选当天的签到时刻，并在命中时加入 3 分钟内随机延迟。
 
 const cookieKey = "nodeseek_cookie";
 const uaKey = "nodeseek_ua";
 const loginUrl = "https://www.nodeseek.com/signIn.html";
 
-// ---- 签到时间随机化 ----
-// cron 每 5 分钟触发一次（08:00 - 12:55），脚本在当天首次触发时于窗口内
-// 随机挑选一个目标时间，命中后加入 3 分钟内随机延迟，彻底打散整点与整分特征。
-const jitterKey = "nodeseek_checkin_state"; // 存储 "<日期>|<目标分钟数>"、"<日期>|running|<timestamp>" 或 "<日期>|done"
-const windowStartMinute = 8 * 60;           // 08:00
-const windowEndMinute = 12 * 60;            // 12:00，需落在 cron 的触发点上
-const maxRandomDelaySec = 180;              // 命中签到时间后的最大随机延迟（秒，3 分钟）
+// ---- 随机签到时刻规划 ----
+// jitterKey 存储: "<日期>|<目标分钟>|<目标秒数>"、"<日期>|running|<timestamp>" 或 "<日期>|done"
+const jitterKey = "nodeseek_checkin_state";
+const windowStartMinute = 8 * 60; // 08:00
+const windowEndMinute = 12 * 60;  // 12:00
 
 function pad2(n) {
     return n < 10 ? "0" + n : "" + n;
@@ -38,37 +37,65 @@ function todayKey() {
     return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate());
 }
 
-// 是否已到今天的随机签到时间；当天首次触发时生成随机目标
-function shouldCheckInNow() {
+// 决策当前是否执行，并返回当前执行所需的延迟秒数
+function getCheckInPlan() {
     const today = todayKey();
-    const parts = ($prefs.valueForKey(jitterKey) || "").split("|");
+    const state = $prefs.valueForKey(jitterKey) || "";
+    const parts = state.split("|");
     const savedDate = parts[0];
-    const savedTarget = parts[1];
+    const status = parts[1];
 
     const now = new Date();
     const nowMinute = now.getHours() * 60 + now.getMinutes();
+    const nowSecond = now.getSeconds();
 
-    if (savedDate === today && savedTarget) {
-        if (savedTarget === "done") return false;
-        if (savedTarget === "running") {
-            const runningTime = parseInt(parts[2] || "0", 10);
-            // 5 分钟防重入保护锁：若正在延迟或执行中且未超时，跳过本次触发避免重复；
-            // 若超过 5 分钟仍未完成，视为上次执行被系统中断/杀后台，允许重新触发。
-            if (Date.now() - runningTime < 5 * 60 * 1000) {
-                return false;
-            }
-            return true;
+    if (savedDate === today) {
+        if (status === "done") {
+            return { shouldRun: false };
         }
-        return nowMinute >= parseInt(savedTarget, 10);
+        if (status === "running") {
+            const runningTime = parseInt(parts[2] || "0", 10);
+            // 防重入锁：若前一个任务在 3 分钟内处于延时/发送中，跳过本次触发
+            if (Date.now() - runningTime < 3 * 60 * 1000) {
+                return { shouldRun: false };
+            }
+            // 超过 3 分钟仍为 running，说明上次被系统后台强杀，允许本次恢复重试
+        } else {
+            const targetMinute = parseInt(status, 10);
+            const targetSecond = parseInt(parts[2] || "20", 10);
+
+            // 正好到达当天规划的目标分钟
+            if (nowMinute === targetMinute) {
+                const delaySec = Math.max(2, targetSecond - nowSecond);
+                return { shouldRun: true, delaySec: delaySec };
+            }
+            // 若因锁屏/系统休眠错过了目标分钟（nowMinute > targetMinute），唤醒时自动补签
+            // 补签附带 3 ~ 25 秒随机抖动，避免卡在唤醒的 00 秒整点
+            if (nowMinute > targetMinute) {
+                const catchUpDelay = Math.floor(Math.random() * 23) + 3;
+                return { shouldRun: true, delaySec: catchUpDelay };
+            }
+            // 尚未到达目标时刻
+            return { shouldRun: false };
+        }
     }
 
-    const target = windowStartMinute + Math.floor(Math.random() * (windowEndMinute - windowStartMinute + 1));
-    $prefs.setValueForKey(today + "|" + target, jitterKey);
-    console.log("[NodeSeek] Today's random check-in target: " + Math.floor(target / 60) + ":" + pad2(target % 60));
-    return nowMinute >= target;
+    // 当天首次唤醒：生成当天的目标分钟（08:00 - 12:00 之间的任意一分钟）和目标秒数（4 ~ 55 秒）
+    const targetMinute = windowStartMinute + Math.floor(Math.random() * (windowEndMinute - windowStartMinute + 1));
+    const targetSecond = Math.floor(Math.random() * 52) + 4;
+    $prefs.setValueForKey(`${today}|${targetMinute}|${targetSecond}`, jitterKey);
+    console.log(`[NodeSeek] Today's random target: ${Math.floor(targetMinute / 60)}:${pad2(targetMinute % 60)}:${pad2(targetSecond)}`);
+
+    if (nowMinute === targetMinute) {
+        return { shouldRun: true, delaySec: Math.max(2, targetSecond - nowSecond) };
+    }
+    if (nowMinute > targetMinute) {
+        const catchUpDelay = Math.floor(Math.random() * 23) + 3;
+        return { shouldRun: true, delaySec: catchUpDelay };
+    }
+    return { shouldRun: false };
 }
 
-// 标记今天已处理完毕，后续触发直接跳过，避免重复请求与重复通知
 function markCheckInDone() {
     $prefs.setValueForKey(todayKey() + "|done", jitterKey);
 }
@@ -85,9 +112,7 @@ function getCookie() {
         const ua = $request.headers['User-Agent'] || $request.headers['user-agent'];
         if (cookie && cookie.includes("session=")) {
             const oldCookie = $prefs.valueForKey(cookieKey);
-            
             if (oldCookie === cookie) {
-                // console.log("[NodeSeek] Cookie is unchanged. Skip."); 
                 $done({});
                 return;
             }
@@ -103,8 +128,8 @@ function getCookie() {
 }
 
 function checkIn() {
-    // 未到当天随机到的签到时刻则静默退出（不产生任何请求）
-    if (!shouldCheckInNow()) {
+    const plan = getCheckInPlan();
+    if (!plan.shouldRun) {
         $done();
         return;
     }
@@ -113,19 +138,20 @@ function checkIn() {
     const ua = $prefs.valueForKey(uaKey);
 
     if (!cookie) {
+        console.log("[NodeSeek] No Cookie found.");
         $notify("NodeSeek", "Check-in Failed", "No Cookie found. Tap to login.", { "open-url": loginUrl });
         $done();
         return;
     }
 
-    // 随机延迟 0 ~ maxRandomDelaySec 秒（默认 3 分钟内），彻底打破整点、整分、整 00 秒触发特征
-    const delaySec = Math.floor(Math.random() * (maxRandomDelaySec + 1));
     const today = todayKey();
-    // 写入 running 锁及时间戳，防止下一个 cron 周期重入触发
-    $prefs.setValueForKey(today + "|running|" + Date.now(), jitterKey);
-    console.log("[NodeSeek] Target time reached. Delaying " + delaySec + "s before sending check-in request...");
+    const delaySec = plan.delaySec || 5;
 
-    setTimeout(() => {
+    // 记录 running 状态锁，带上当前时间戳
+    $prefs.setValueForKey(`${today}|running|${Date.now()}`, jitterKey);
+    console.log(`[NodeSeek] Target time reached. Delaying ${delaySec}s before sending check-in request...`);
+
+    setTimeout(function() {
         executeCheckIn(cookie, ua);
     }, delaySec * 1000);
 }
@@ -149,20 +175,16 @@ function executeCheckIn(cookie, ua) {
     $task.fetch(req).then(response => {
         try {
             const body = JSON.parse(response.body);
-            
             if (body.success === true) {
                 console.log("[NodeSeek] Check-in: Success - " + body.message);
                 $notify("NodeSeek", "Check-in Success", body.message);
                 markCheckInDone();
-            
             } else if (body.message && (body.message.includes("今天已完成签到，请勿重复操作") || body.message.includes("already"))) {
                 console.log("[NodeSeek] Check-in: Skipped (Already done)");
                 markCheckInDone();
-            
             } else if (body.message === "USER NOT FOUND") {
                 console.log("[NodeSeek] Cookie Invalid: " + body.message);
                 $notify("NodeSeek", "Session Expired", "Cookie expired. Tap to re-login.", { "open-url": loginUrl });
-            
             } else {
                 console.log("[NodeSeek] Check-in: ERR - " + JSON.stringify(body));
                 $notify("NodeSeek", "Check-in Error", body.message, { "open-url": loginUrl });
@@ -177,12 +199,12 @@ function executeCheckIn(cookie, ua) {
         }
         $done();
     }, reason => {
-        // 网络异常不标记完成，清除 running 锁，窗口内后续触发会自动重试
         console.log("[NodeSeek] Network ERR: " + reason.error);
         $notify("NodeSeek", "Network Error", reason.error);
+        // 网络失败清空 running 锁，允许后续继续补试
         const now = new Date();
         const nowMinute = now.getHours() * 60 + now.getMinutes();
-        $prefs.setValueForKey(todayKey() + "|" + nowMinute, jitterKey);
+        $prefs.setValueForKey(`${todayKey()}|${nowMinute}|10`, jitterKey);
         $done();
     });
 }
